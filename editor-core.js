@@ -1,6 +1,6 @@
 /**
  * editor-core.js
- * Core principal mejorado con sistema de subcomponentes avanzado
+ * Core completo con todas las funcionalidades originales + mejoras de subcomponentes
  */
 
 import * as THREE from 'three';
@@ -55,7 +55,17 @@ transform.setSize(0.8);
 transform.setSpace('world');
 scene.add(transform);
 
+// Gizmo para subcomponentes (más pequeño)
+const subTransform = new TransformControls(camera, renderer.domElement);
+subTransform.setSize(0.5);
+subTransform.setSpace('world');
+scene.add(subTransform);
+
 transform.addEventListener('dragging-changed', (e) => {
+  orbit.enabled = !e.value;
+});
+
+subTransform.addEventListener('dragging-changed', (e) => {
   orbit.enabled = !e.value;
 });
 
@@ -64,9 +74,24 @@ let nextId = 1;
 const objects = [];
 let selectedObject = null;
 let currentMode = 'translate';
-let isSelectMode = false;
+let isEditMode = false; // Modo Edición vs Modo Objeto
 
 const history = { past: [], future: [] };
+
+/* ===== MEASUREMENT STATE ===== */
+let measurementState = {
+  active: false,
+  startPos: null,
+  currentPos: null,
+  distance: 0
+};
+
+/* ===== CAMERA HELPER STATE ===== */
+let cameraHelper = {
+  originalDistance: 0,
+  isDragging: false,
+  dragStartCamDist: 0
+};
 
 /* ===== SUBCOMPONENTS SYSTEM ===== */
 const subApi = {
@@ -92,6 +117,89 @@ function addToHistory(action) {
 function updateUndoRedoButtons() {
   document.getElementById('btn-undo').disabled = history.past.length === 0;
   document.getElementById('btn-redo').disabled = history.future.length === 0;
+}
+
+/* ===== MEASUREMENT FUNCTIONS ===== */
+function startMeasurement(worldPos) {
+  measurementState.active = true;
+  measurementState.startPos = worldPos.clone();
+  measurementState.currentPos = worldPos.clone();
+  measurementState.distance = 0;
+  
+  document.getElementById('measurement-line').classList.add('visible');
+  document.getElementById('distance-label').classList.add('visible');
+}
+
+function updateMeasurement(worldPos) {
+  if (!measurementState.active) return;
+  
+  measurementState.currentPos = worldPos.clone();
+  measurementState.distance = measurementState.startPos.distanceTo(worldPos);
+  
+  // Actualizar línea
+  const start = measurementState.startPos.clone();
+  const end = worldPos.clone();
+  
+  const startScreen = start.project(camera);
+  const endScreen = end.project(camera);
+  
+  const x1 = (startScreen.x * 0.5 + 0.5) * window.innerWidth;
+  const y1 = (-startScreen.y * 0.5 + 0.5) * window.innerHeight;
+  const x2 = (endScreen.x * 0.5 + 0.5) * window.innerWidth;
+  const y2 = (-endScreen.y * 0.5 + 0.5) * window.innerHeight;
+  
+  document.getElementById('origin-dot').setAttribute('cx', x1);
+  document.getElementById('origin-dot').setAttribute('cy', y1);
+  document.getElementById('measure-line').setAttribute('x1', x1);
+  document.getElementById('measure-line').setAttribute('y1', y1);
+  document.getElementById('measure-line').setAttribute('x2', x2);
+  document.getElementById('measure-line').setAttribute('y2', y2);
+  
+  // Actualizar label
+  const label = document.getElementById('distance-label');
+  label.textContent = measurementState.distance.toFixed(2) + ' m';
+  label.style.left = ((x1 + x2) / 2) + 'px';
+  label.style.top = ((y1 + y2) / 2 - 30) + 'px';
+}
+
+function endMeasurement() {
+  measurementState.active = false;
+  document.getElementById('measurement-line').classList.remove('visible');
+  document.getElementById('distance-label').classList.remove('visible');
+}
+
+/* ===== CAMERA HELPER (Zoom dinámico al arrastrar) ===== */
+function startCameraHelper() {
+  if (!selectedObject) return;
+  
+  const box = new THREE.Box3().setFromObject(selectedObject);
+  const center = box.getCenter(new THREE.Vector3());
+  const distance = camera.position.distanceTo(center);
+  
+  cameraHelper.originalDistance = distance;
+  cameraHelper.dragStartCamDist = distance;
+  cameraHelper.isDragging = true;
+}
+
+function updateCameraHelper(dragDistance) {
+  if (!cameraHelper.isDragging || !selectedObject) return;
+  
+  // A mayor distancia de arrastre, más zoom out
+  const zoomFactor = 1 + (dragDistance * 0.15);
+  const targetDistance = cameraHelper.dragStartCamDist * zoomFactor;
+  
+  const box = new THREE.Box3().setFromObject(selectedObject);
+  const center = box.getCenter(new THREE.Vector3());
+  
+  const direction = camera.position.clone().sub(center).normalize();
+  camera.position.copy(center).add(direction.multiplyScalar(targetDistance));
+  
+  orbit.target.copy(center);
+  orbit.update();
+}
+
+function endCameraHelper() {
+  cameraHelper.isDragging = false;
 }
 
 /* ===== OBJECT MANAGEMENT ===== */
@@ -151,18 +259,24 @@ function selectObject(obj) {
     obj.material.color.setHex(CFG.selectionColor);
     SUB.setBaselineFromCurrent();
     
-    if (isSelectMode) {
+    if (isEditMode) {
+      // MODO EDICIÓN: mostrar subcomponentes, sin gizmo de objeto
       SUB.applySubVisibility(obj);
       transform.detach();
+      subTransform.detach();
       document.getElementById('subtoolbar').classList.add('visible');
       document.getElementById('exit-manipulation').classList.add('visible');
     } else {
+      // MODO OBJETO: gizmo normal, sin subcomponentes
       transform.attach(obj);
+      transform.setMode(currentMode);
+      subTransform.detach();
       document.getElementById('subtoolbar').classList.remove('visible');
       document.getElementById('exit-manipulation').classList.remove('visible');
     }
   } else {
     transform.detach();
+    subTransform.detach();
     document.getElementById('subtoolbar').classList.remove('visible');
     document.getElementById('exit-manipulation').classList.remove('visible');
   }
@@ -200,16 +314,23 @@ function onPointerDown(event) {
 
   raycaster.setFromCamera(pointer, camera);
 
-  // Subcomponent mode
-  if (isSelectMode && selectedObject) {
+  // MODO EDICIÓN: pick de subcomponentes
+  if (isEditMode && selectedObject) {
     const changed = SUB.togglePick(raycaster, selectedObject);
-    if (changed) {
+    if (changed && SUB.hasSelection()) {
+      // Attach gizmo to selection center
+      const center = SUB.getSelectionWorldCenter();
+      if (center) {
+        subTransform.position.copy(center);
+        subTransform.attach(selectedObject);
+        subTransform.setMode(currentMode);
+      }
       checkAndShowWeldPanel();
     }
     return;
   }
 
-  // Normal object selection
+  // MODO OBJETO: selección normal
   const hits = raycaster.intersectObjects(objects, false);
   if (hits.length > 0) {
     selectObject(hits[0].object);
@@ -218,23 +339,36 @@ function onPointerDown(event) {
   }
 }
 
+/* ===== TRANSFORM EVENTS ===== */
 let isDragging = false;
 let dragStarted = false;
+let dragStartPosition = null;
+let dragDistance = 0;
 
+// OBJETO
 transform.addEventListener('mouseDown', () => {
   isDragging = false;
   dragStarted = true;
+  dragStartPosition = selectedObject ? selectedObject.position.clone() : null;
+  dragDistance = 0;
+  startCameraHelper();
+  if (selectedObject) startMeasurement(selectedObject.position);
 });
 
 transform.addEventListener('objectChange', () => {
   if (dragStarted) {
     isDragging = true;
   }
+  
+  if (selectedObject && dragStartPosition) {
+    dragDistance = selectedObject.position.distanceTo(dragStartPosition);
+    updateCameraHelper(dragDistance);
+    updateMeasurement(selectedObject.position);
+  }
 });
 
 transform.addEventListener('mouseUp', () => {
   if (isDragging && selectedObject) {
-    // Commit transform
     addToHistory({
       type: 'transform',
       id: selectedObject.userData.id,
@@ -245,6 +379,58 @@ transform.addEventListener('mouseUp', () => {
   }
   isDragging = false;
   dragStarted = false;
+  dragStartPosition = null;
+  endCameraHelper();
+  endMeasurement();
+});
+
+// SUBCOMPONENTES
+let subDragStarted = false;
+let subDragDistance = 0;
+
+subTransform.addEventListener('mouseDown', () => {
+  subDragStarted = true;
+  subDragDistance = 0;
+  const center = SUB.getSelectionWorldCenter();
+  if (center) startMeasurement(center);
+});
+
+subTransform.addEventListener('objectChange', () => {
+  if (!subDragStarted || !selectedObject) return;
+  
+  // Calcular delta de movimiento
+  const currentCenter = SUB.getSelectionWorldCenter();
+  if (!currentCenter) return;
+  
+  // Aplicar movimiento a los subcomponentes seleccionados
+  const worldDelta = new THREE.Vector3().subVectors(
+    subTransform.position,
+    currentCenter
+  );
+  
+  subDragDistance = SUB.applySelectionWorldDelta(selectedObject, worldDelta);
+  
+  // Actualizar posición del gizmo al nuevo centro
+  const newCenter = SUB.getSelectionWorldCenter();
+  if (newCenter) {
+    subTransform.position.copy(newCenter);
+    updateMeasurement(newCenter);
+  }
+  
+  updateCameraHelper(subDragDistance);
+});
+
+subTransform.addEventListener('mouseUp', () => {
+  if (subDragStarted && selectedObject) {
+    const action = SUB.commitSelectionDeltaAsAction(selectedObject.userData.id);
+    if (action) addToHistory(action);
+    
+    SUB.setBaselineFromCurrent();
+    checkAndShowWeldPanel();
+  }
+  subDragStarted = false;
+  endMeasurement();
+  endCameraHelper();
 });
 
 /* ===== WELD PANEL ===== */
@@ -316,8 +502,13 @@ document.querySelectorAll('[data-mode]').forEach(btn => {
     const mode = btn.dataset.mode;
     
     if (mode === 'select') {
-      isSelectMode = true;
+      // ENTRAR A MODO EDICIÓN
+      isEditMode = true;
+      currentMode = 'translate'; // Default en modo edición
+      
       transform.detach();
+      subTransform.setMode('translate');
+      
       document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
       btn.classList.add('active');
       document.getElementById('subtoolbar').classList.add('visible');
@@ -327,30 +518,25 @@ document.querySelectorAll('[data-mode]').forEach(btn => {
         SUB.applySubVisibility(selectedObject);
       }
     } else {
-      isSelectMode = false;
+      // CAMBIAR MODO DE TRANSFORMACIÓN (funciona en ambos modos)
       currentMode = mode;
-      transform.setMode(mode);
       
-      document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
-      btn.classList.add('active');
-      document.getElementById('subtoolbar').classList.remove('visible');
-      document.getElementById('exit-manipulation').classList.remove('visible');
-      
-      if (selectedObject) {
-        transform.attach(selectedObject);
-        if (selectedObject.userData.sub) {
-          selectedObject.userData.sub.vertexPoints.visible = false;
-          selectedObject.userData.sub.edgeLines.visible = false;
-          selectedObject.userData.sub.faceWire.visible = false;
-        }
+      if (isEditMode) {
+        subTransform.setMode(mode);
+      } else {
+        transform.setMode(mode);
       }
+      
+      document.querySelectorAll('[data-mode]').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
     }
   };
 });
 
-// Exit manipulation
+// Exit manipulation (SALIR DE MODO EDICIÓN)
 document.getElementById('exit-manipulation').onclick = () => {
-  isSelectMode = false;
+  isEditMode = false;
+  
   document.getElementById('subtoolbar').classList.remove('visible');
   document.getElementById('exit-manipulation').classList.remove('visible');
   
@@ -360,12 +546,14 @@ document.getElementById('exit-manipulation').onclick = () => {
       selectedObject.userData.sub.edgeLines.visible = false;
       selectedObject.userData.sub.faceWire.visible = false;
     }
+    subTransform.detach();
     transform.attach(selectedObject);
     transform.setMode(currentMode);
   }
   
   SUB.clearSelection();
   
+  // Volver a modo Move
   document.querySelectorAll('.tool-btn').forEach(b => b.classList.remove('active'));
   document.getElementById('btn-move').classList.add('active');
 };
@@ -402,6 +590,7 @@ document.getElementById('sub-explode').onclick = () => {
 
 document.getElementById('sub-clear').onclick = () => {
   SUB.clearSelection();
+  subTransform.detach();
   if (selectedObject) SUB.applySubVisibility(selectedObject);
 };
 
@@ -426,7 +615,6 @@ document.getElementById('btn-undo').onclick = () => {
   const action = history.past.pop();
   history.future.push(action);
   
-  // Apply undo logic here (simplified)
   if (action.type === 'subEdit') {
     SUB.applySubEditInverse(action);
   }
@@ -439,7 +627,6 @@ document.getElementById('btn-redo').onclick = () => {
   const action = history.future.pop();
   history.past.push(action);
   
-  // Apply redo logic here (simplified)
   if (action.type === 'subEdit') {
     SUB.applySubEditForward(action);
   }
@@ -535,3 +722,5 @@ function animate() {
 }
 
 animate();
+
+console.log('✅ MR Studio Pro cargado correctamente');
