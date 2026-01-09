@@ -188,7 +188,6 @@
     .divider{ width:1px; background:rgba(255,255,255,.15); margin:0 4px; }
     body.light-mode .divider{ background:rgba(0,0,0,.12); }
 
-    /* Subtoolbar */
     #subtoolbar-container{
       position:absolute;
       bottom:calc(112px + env(safe-area-inset-bottom));
@@ -238,7 +237,6 @@
       font-size:12px; font-weight:900;
     }
 
-    /* Weld panel */
     #weld-panel {
       position:absolute; bottom:-150px; left:0; width:100%;
       background:rgba(44,44,46,.98); color:#fff; padding:20px 0;
@@ -258,7 +256,6 @@
     .btn-no{ background:#d63031; color:#fff; }
     .btn-action:active{ transform:scale(.97); }
 
-    /* measurement */
     #measurement-line{ position:absolute; pointer-events:none; opacity:0; transition:opacity .15s; z-index:155; }
     #measurement-line.visible{ opacity:1; }
     #distance-label{
@@ -272,7 +269,6 @@
     }
     #distance-label.visible{ opacity:1; }
 
-    /* confirm mini */
     #confirm-dialog{
       position:absolute;
       bottom:calc(150px + env(safe-area-inset-bottom));
@@ -294,7 +290,6 @@
     .mini-btn.cancel{ background:rgba(255,59,48,.95); }
     .mini-btn.ok{ background:rgba(52,199,89,.95); }
 
-    /* axis dialog */
     #axis-input-dialog{
       position:absolute; top:50%; left:50%; transform:translate(-50%,-50%);
       display:none; z-index:260;
@@ -337,7 +332,6 @@
     .btn-cancel-axis{ background:#FF3B30; }
     .btn-apply:active, .btn-cancel-axis:active{ transform:scale(.97); }
 
-    /* edit camera panel */
     #edit-cam-panel{
       position:absolute;
       right:calc(14px + env(safe-area-inset-right));
@@ -368,6 +362,21 @@
       box-shadow:0 14px 34px rgba(0,122,255,.22);
     }
     .camlock-btn:active{ transform:scale(.95); }
+
+    #loading-error {
+      position: fixed;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      background: rgba(255, 59, 48, 0.95);
+      color: white;
+      padding: 20px 30px;
+      border-radius: 16px;
+      font-weight: 900;
+      display: none;
+      z-index: 10000;
+      text-align: center;
+    }
   </style>
 
   <script type="importmap">
@@ -381,6 +390,8 @@
 </head>
 
 <body>
+
+  <div id="loading-error">Error cargando módulos. Verifica tu conexión.</div>
 
   <div id="overlay">
     <h1>🎨 MR STUDIO PRO</h1>
@@ -507,6 +518,24 @@
     </div>
   </div>
 
-  <script type="module" src="./editor-core.js"></script>
+  <script type="module">
+    // Manejador de errores
+    window.addEventListener('error', (e) => {
+      console.error('Error:', e);
+      document.getElementById('loading-error').style.display = 'block';
+      setTimeout(() => {
+        document.getElementById('loading-error').style.display = 'none';
+      }, 5000);
+    });
+
+    // Importar el core
+    try {
+      await import('./editor-core.js');
+    } catch (error) {
+      console.error('Error loading editor-core.js:', error);
+      document.getElementById('loading-error').style.display = 'block';
+      document.getElementById('loading-error').textContent = 'Error: Asegúrate de que editor-core.js y editor-subcomponents.js estén en la misma carpeta';
+    }
+  </script>
 </body>
 </html>
