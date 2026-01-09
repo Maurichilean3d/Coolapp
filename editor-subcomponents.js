@@ -1,293 +1,558 @@
 /**
  * editor-subcomponents.js
- * Gestiona la edición de vértices, bordes y caras usando "Helpers" físicos.
+ * Sistema avanzado de edición de subcomponentes con Merge/Explode y Welding
  */
+
 export function setupSubcomponents(api) {
-    const { THREE, scene, transformControl } = api;
+  const { THREE, CFG, scene, findObjectById } = api;
 
-    // Grupo contenedor para los helpers visuales
-    const helperGroup = new THREE.Group();
-    scene.add(helperGroup);
+  const state = {
+    flags: { verts: true, edges: false, faces: false, explode: false },
+    selection: [],
+    baseline: null,
+    weldPending: null
+  };
 
-    // Estado interno
-    let targetObject = null;
-    let currentMode = 'vertex'; // vertex, edge, face
-    let isExplode = false; // Modo explode (separados) o merge (unidos)
-    
-    // Almacenes de helpers
-    let vHandles = [], eHandles = [], fHandles = [];
-    let mapV = []; // Mapea ID del Helper -> Array de índices reales en la geometría
+  const GROUP_EPS = 1e-4;
 
-    // Materiales reutilizables
-    const matVertex = new THREE.MeshBasicMaterial({ color: 0xe74c3c, depthTest: false });
-    const matEdge = new THREE.MeshBasicMaterial({ color: 0xf1c40f, depthTest: false });
-    const matFace = new THREE.MeshBasicMaterial({ color: 0x3498db, depthTest: false, transparent: true, opacity: 0.6, side: THREE.DoubleSide });
+  /* ===== UTILITIES ===== */
+  function keyForPos(x, y, z) {
+    const qx = Math.round(x / GROUP_EPS);
+    const qy = Math.round(y / GROUP_EPS);
+    const qz = Math.round(z / GROUP_EPS);
+    return `${qx}_${qy}_${qz}`;
+  }
 
-    // --- FUNCIONES PRINCIPALES ---
+  function buildVertexGroups(obj) {
+    const pos = obj.geometry?.attributes?.position;
+    if (!pos) return new Map();
 
-    function activate(obj) {
-        targetObject = obj;
-        helperGroup.visible = true;
-        rebuildHelpers();
+    const map = new Map();
+    for (let i = 0; i < pos.count; i++) {
+      const k = keyForPos(pos.getX(i), pos.getY(i), pos.getZ(i));
+      const arr = map.get(k);
+      if (arr) arr.push(i);
+      else map.set(k, [i]);
+    }
+    return map;
+  }
+
+  function getGroupForVertexIndex(obj, idx) {
+    if (state.flags.explode) return { key: `i:${idx}`, indices: [idx] };
+
+    const pos = obj.geometry?.attributes?.position;
+    if (!pos) return { key: `i:${idx}`, indices: [idx] };
+
+    const k = keyForPos(pos.getX(idx), pos.getY(idx), pos.getZ(idx));
+    const groups = buildVertexGroups(obj);
+    const indices = groups.get(k) ?? [idx];
+    return { key: `g:${k}`, indices };
+  }
+
+  /* ===== FLAGS ===== */
+  function getFlags() { return { ...state.flags }; }
+  function setFlags(patch) {
+    state.flags = { ...state.flags, ...patch };
+  }
+
+  /* ===== BASELINE ===== */
+  function setBaselineFromCurrent() {
+    const obj = getSelectedObject();
+    if (!obj) return;
+    const pos = obj.geometry?.attributes?.position;
+    if (!pos) return;
+    state.baseline = {
+      id: obj.userData.id,
+      positions: new Float32Array(pos.array)
+    };
+  }
+
+  function cancelToBaseline() {
+    const obj = getSelectedObject();
+    if (!obj || !state.baseline || state.baseline.id !== obj.userData.id) return;
+    const pos = obj.geometry?.attributes?.position;
+    if (!pos) return;
+
+    pos.array.set(state.baseline.positions);
+    pos.needsUpdate = true;
+    obj.geometry.computeVertexNormals();
+    obj.geometry.computeBoundingBox();
+    obj.geometry.computeBoundingSphere();
+    refreshHelpers(obj);
+  }
+
+  function getSelectedObject() {
+    if (state.baseline?.id != null) return findObjectById(state.baseline.id);
+    return null;
+  }
+
+  /* ===== VISUAL HELPERS ===== */
+  function ensureHelpers(obj) {
+    if (!obj || !obj.geometry) return;
+    if (!obj.userData.sub) obj.userData.sub = {};
+
+    // Vertex points
+    if (!obj.userData.sub.vertexPoints) {
+      const geom = obj.geometry;
+      const posAttr = geom.attributes.position;
+
+      const ptsGeo = new THREE.BufferGeometry();
+      ptsGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(posAttr.array), 3));
+
+      const col = new Float32Array(posAttr.count * 3);
+      for (let i = 0; i < posAttr.count; i++) {
+        col[i*3+0] = 0.91; col[i*3+1] = 0.3; col[i*3+2] = 0.24; // #e74c3c
+      }
+      ptsGeo.setAttribute('color', new THREE.BufferAttribute(col, 3));
+
+      const ptsMat = new THREE.PointsMaterial({
+        size: 0.16,
+        vertexColors: true,
+        depthTest: false,
+        transparent: true,
+        opacity: 0.95
+      });
+
+      const pts = new THREE.Points(ptsGeo, ptsMat);
+      pts.renderOrder = 998;
+      pts.visible = false;
+      pts.name = 'VertexPoints';
+      obj.add(pts);
+      obj.userData.sub.vertexPoints = pts;
     }
 
-    function deactivate() {
-        targetObject = null;
-        helperGroup.clear();
-        helperGroup.visible = false;
-        transformControl.detach();
+    // Edge helper
+    if (!obj.userData.sub.edgeLines) {
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(obj.geometry),
+        new THREE.LineBasicMaterial({ 
+          color: 0xf1c40f, 
+          transparent: true, 
+          opacity: 0.7, 
+          depthTest: false,
+          linewidth: 2
+        })
+      );
+      edges.visible = false;
+      edges.renderOrder = 997;
+      edges.name = 'EdgeLines';
+      obj.add(edges);
+      obj.userData.sub.edgeLines = edges;
     }
 
-    function setMode(mode) {
-        currentMode = mode;
-        transformControl.detach();
-        updateVisibility();
+    // Face wire
+    if (!obj.userData.sub.faceWire) {
+      const wire = new THREE.LineSegments(
+        new THREE.WireframeGeometry(obj.geometry),
+        new THREE.LineBasicMaterial({ 
+          color: 0x3498db, 
+          transparent: true, 
+          opacity: 0.45, 
+          depthTest: false 
+        })
+      );
+      wire.visible = false;
+      wire.renderOrder = 996;
+      wire.name = 'FaceWire';
+      obj.add(wire);
+      obj.userData.sub.faceWire = wire;
+    }
+  }
+
+  function refreshHelpers(obj) {
+    if (!obj?.userData?.sub) return;
+
+    const pts = obj.userData.sub.vertexPoints;
+    if (pts) {
+      const src = obj.geometry.attributes.position.array;
+      const dst = pts.geometry.attributes.position;
+      dst.array.set(src);
+      dst.needsUpdate = true;
     }
 
-    function setExplode(bool) {
-        isExplode = bool;
-        // Si cambiamos modo, hay que reconstruir los helpers
-        if (targetObject) rebuildHelpers();
+    if (obj.userData.sub.edgeLines) {
+      obj.remove(obj.userData.sub.edgeLines);
+      obj.userData.sub.edgeLines.geometry.dispose();
+      obj.userData.sub.edgeLines.material.dispose();
+      obj.userData.sub.edgeLines = null;
+    }
+    if (obj.userData.sub.faceWire) {
+      obj.remove(obj.userData.sub.faceWire);
+      obj.userData.sub.faceWire.geometry.dispose();
+      obj.userData.sub.faceWire.material.dispose();
+      obj.userData.sub.faceWire = null;
     }
 
-    function updateVisibility() {
-        vHandles.forEach(h => h.visible = (currentMode === 'vertex'));
-        eHandles.forEach(h => h.visible = (currentMode === 'edge'));
-        fHandles.forEach(h => h.visible = (currentMode === 'face'));
+    ensureHelpers(obj);
+    applySubVisibility(obj);
+    recolorSelection(obj);
+  }
+
+  function applySubVisibility(obj) {
+    ensureHelpers(obj);
+    obj.userData.sub.vertexPoints.visible = !!state.flags.verts;
+    obj.userData.sub.edgeLines.visible = !!state.flags.edges;
+    obj.userData.sub.faceWire.visible = !!state.flags.faces;
+    recolorSelection(obj);
+  }
+
+  /* ===== SELECTION ===== */
+  function clearSelection() {
+    state.selection = [];
+    setBaselineFromCurrent();
+  }
+  function hasSelection() { return state.selection.length > 0; }
+
+  function makeSelectionKey(kind, key, indices) {
+    if (kind === 'v') return `v:${key}`;
+    const sig = indices.slice().sort((a,b)=>a-b).join(',');
+    return `${kind}:${sig}`;
+  }
+
+  function selectionIndexByKey(selKey) {
+    return state.selection.findIndex(s => s.key === selKey);
+  }
+
+  function centroidLocalFromIndices(obj, indices) {
+    const pos = obj.geometry.attributes.position;
+    const c = new THREE.Vector3();
+    for (const i of indices) c.add(new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i)));
+    return c.multiplyScalar(1 / Math.max(1, indices.length));
+  }
+
+  function recolorSelection(obj) {
+    if (!obj?.userData?.sub?.vertexPoints) return;
+    const pts = obj.userData.sub.vertexPoints;
+    const col = pts.geometry.attributes.color;
+
+    // Reset all to vertex color
+    for (let i = 0; i < col.count; i++) {
+      col.setXYZ(i, 0.91, 0.3, 0.24); // #e74c3c
     }
 
-    // --- CONSTRUCCIÓN DE HELPERS ---
+    // Mark selected (cyan)
+    const selectedSet = new Set();
+    state.selection.forEach(s => s.indices.forEach(i => selectedSet.add(i)));
+    selectedSet.forEach(i => col.setXYZ(i, 0.2, 0.7, 1.0));
 
-    function rebuildHelpers() {
-        if (!targetObject) return;
-        
-        helperGroup.clear();
-        vHandles = []; eHandles = []; fHandles = [];
-        mapV = [];
+    col.needsUpdate = true;
+  }
 
-        const geometry = targetObject.geometry;
-        const pos = geometry.attributes.position;
-        
-        // 1. GENERAR VÉRTICES (Esferas)
-        // Agrupamos vértices por posición si estamos en modo MERGE, sino individuales
-        const groups = {}; 
-        
-        for (let i = 0; i < pos.count; i++) {
-            let key;
-            if (isExplode) {
-                key = `idx_${i}`; // Clave única por índice
-            } else {
-                // Clave basada en posición (redondeada para agrupar)
-                const x = pos.getX(i).toFixed(3);
-                const y = pos.getY(i).toFixed(3);
-                const z = pos.getZ(i).toFixed(3);
-                key = `${x},${y},${z}`;
-            }
+  function getSelectionWorldCenter() {
+    const obj = getSelectedObject();
+    if (!obj || !hasSelection()) return null;
 
-            if (!groups[key]) groups[key] = [];
-            groups[key].push(i);
-        }
+    const c = new THREE.Vector3();
+    for (const s of state.selection) {
+      const w = obj.localToWorld(s.centroidLocal.clone());
+      c.add(w);
+    }
+    c.multiplyScalar(1 / state.selection.length);
+    return c;
+  }
 
-        // Crear malla para cada grupo
-        let vIdx = 0;
-        const sphereGeo = new THREE.SphereGeometry(0.1, 8, 8); // Low poly esfera
-        
-        // Transformar coordenadas locales a globales para posicionar los helpers
-        const objMatrix = targetObject.matrixWorld;
+  function getSelectionWorldCenterForObject(obj) {
+    if (!obj || !hasSelection()) return null;
+    const c = new THREE.Vector3();
+    for (const s of state.selection) {
+      const w = obj.localToWorld(s.centroidLocal.clone());
+      c.add(w);
+    }
+    c.multiplyScalar(1 / state.selection.length);
+    return c;
+  }
 
-        for (const key in groups) {
-            const indices = groups[key];
-            const i = indices[0]; // Usamos el primero como referencia
-            
-            const localPos = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
-            const worldPos = localPos.clone().applyMatrix4(objMatrix);
+  /* ===== PICKING ===== */
+  function approximateEdgeByNearest(obj, worldPoint) {
+    const geom = obj.geometry;
+    const pos = geom.attributes.position;
+    const local = obj.worldToLocal(worldPoint.clone());
 
-            const mesh = new THREE.Mesh(sphereGeo, matVertex.clone());
-            mesh.position.copy(worldPos);
-            mesh.userData = { type: 'vertex', id: vIdx, indices: indices };
-            
-            helperGroup.add(mesh);
-            vHandles.push(mesh);
-            mapV[vIdx] = indices;
-            vIdx++;
-        }
+    let best = -1, bestD = Infinity;
+    for (let i=0; i<pos.count; i++){
+      const dx = pos.getX(i) - local.x;
+      const dy = pos.getY(i) - local.y;
+      const dz = pos.getZ(i) - local.z;
+      const d = dx*dx + dy*dy + dz*dz;
+      if (d < bestD){ bestD = d; best = i; }
+    }
+    if (best < 0) return null;
 
-        // 2. GENERAR BORDES (Cajas finas)
-        // Conecta vertices cercanos (lógica simplificada visual)
-        if (!isExplode) { // Solo generamos helpers de bordes en modo merge para evitar caos
-            const boxGeo = new THREE.BoxGeometry(0.05, 0.05, 1);
-            for (let i = 0; i < vHandles.length; i++) {
-                for (let j = i + 1; j < vHandles.length; j++) {
-                    const p1 = vHandles[i].position;
-                    const p2 = vHandles[j].position;
-                    const dist = p1.distanceTo(p2);
-                    
-                    // Umbral mágico para detectar borde visual (ajustable)
-                    if (dist > 0.1 && dist < 2.5) { 
-                        const mesh = new THREE.Mesh(boxGeo, matEdge.clone());
-                        const mid = p1.clone().add(p2).multiplyScalar(0.5);
-                        mesh.position.copy(mid);
-                        mesh.lookAt(p2);
-                        mesh.scale.z = dist;
-                        mesh.userData = { type: 'edge', v1: i, v2: j };
-                        helperGroup.add(mesh);
-                        eHandles.push(mesh);
-                    }
-                }
-            }
-        }
+    let best2 = -1, bestD2 = Infinity;
+    for (let i=0; i<pos.count; i++){
+      if (i === best) continue;
+      const dx = pos.getX(i) - local.x;
+      const dy = pos.getY(i) - local.y;
+      const dz = pos.getZ(i) - local.z;
+      const d = dx*dx + dy*dy + dz*dz;
+      if (d < bestD2){ bestD2 = d; best2 = i; }
+    }
+    if (best2 < 0) return null;
+    return [best, best2];
+  }
 
-        // 3. GENERAR CARAS (Planos en centroides)
-        // Detectar caras es complejo en "sopa de triangulos", usamos un aprox visual o normales básicas
-        // Para simplificar este ejemplo y que funcione 100%, usaremos los triángulos de la geometría original
-        // si no es muy densa. O un helper genérico.
-        // *Mejora*: Usaremos el método de normales del archivo original para simplificar.
-        // Aquí simplificamos creando helpers en el centroide de grupos de 3 handles cercanos.
-        // (Nota: Para producción real se requiere análisis de topología, aquí usamos la visualización).
-        
-        updateVisibility();
+  function togglePick(raycaster, obj) {
+    ensureHelpers(obj);
+
+    if (!state.baseline || state.baseline.id !== obj.userData.id) {
+      state.baseline = null;
+      setBaselineFromCurrent();
     }
 
-    // --- INTERACCIÓN Y ACTUALIZACIÓN ---
+    // Vertex pick
+    if (state.flags.verts && obj.userData.sub.vertexPoints) {
+      const hits = raycaster.intersectObject(obj.userData.sub.vertexPoints, true);
+      if (hits.length) {
+        const idx = hits[0].index;
 
-    function onPointerDown(raycaster) {
-        let candidates = [];
-        if (currentMode === 'vertex') candidates = vHandles;
-        else if (currentMode === 'edge') candidates = eHandles;
-        else if (currentMode === 'face') candidates = fHandles;
+        const grp = getGroupForVertexIndex(obj, idx);
+        const centroidLocal = centroidLocalFromIndices(obj, grp.indices);
+        const selKey = makeSelectionKey('v', grp.key, grp.indices);
 
-        const intersects = raycaster.intersectObjects(candidates);
-        if (intersects.length > 0) {
-            transformControl.attach(intersects[0].object);
-        } else {
-            transformControl.detach();
-        }
+        const existing = selectionIndexByKey(selKey);
+        if (existing >= 0) state.selection.splice(existing, 1);
+        else state.selection.push({ kind: 'v', key: selKey, indices: grp.indices.slice(), centroidLocal });
+
+        recolorSelection(obj);
+        return true;
+      }
     }
 
-    // Listener para cuando movemos un Helper
-    transformControl.addEventListener('objectChange', () => {
-        const handle = transformControl.object;
-        if (!handle || !targetObject) return;
+    // Edge pick
+    if (state.flags.edges && obj.userData.sub.edgeLines) {
+      const hits = raycaster.intersectObject(obj.userData.sub.edgeLines, true);
+      if (hits.length) {
+        const p = hits[0].point.clone();
+        const pair = approximateEdgeByNearest(obj, p);
+        if (!pair) return false;
 
-        // Convertir posición world del handle a local del objeto
-        const inverseMatrix = targetObject.matrixWorld.clone().invert();
-        
-        if (handle.userData.type === 'vertex') {
-            updateVertexPosition(handle, inverseMatrix);
-        } else if (handle.userData.type === 'edge') {
-            // Mover los dos vértices asociados
-            const v1 = vHandles[handle.userData.v1];
-            const v2 = vHandles[handle.userData.v2];
-            
-            // Recalcular posiciones relativas (simple)
-            // Para una UX perfecta, deberíamos guardar el delta. Aquí reconstruimos posición:
-            const axis = new THREE.Vector3(0,0,1).applyQuaternion(handle.quaternion).normalize();
-            const len = handle.scale.z;
-            
-            v1.position.copy(handle.position).addScaledVector(axis, -len/2);
-            v2.position.copy(handle.position).addScaledVector(axis, len/2);
-            
-            updateVertexPosition(v1, inverseMatrix);
-            updateVertexPosition(v2, inverseMatrix);
-        }
+        const centroidLocal = centroidLocalFromIndices(obj, pair);
+        const selKey = makeSelectionKey('e', 'edge', pair);
+        const existing = selectionIndexByKey(selKey);
+        if (existing >= 0) state.selection.splice(existing, 1);
+        else state.selection.push({ kind: 'e', key: selKey, indices: pair.slice(), centroidLocal });
 
-        // Actualizar visual de los bordes conectados si movemos vértices
-        updateHelperLinks(handle);
+        recolorSelection(obj);
+        return true;
+      }
+    }
+
+    // Face pick
+    if (state.flags.faces) {
+      const hits = raycaster.intersectObject(obj, false);
+      if (hits.length) {
+        const f = hits[0].face;
+        if (!f) return false;
+        const tri = [f.a, f.b, f.c];
+        const centroidLocal = centroidLocalFromIndices(obj, tri);
+        const selKey = makeSelectionKey('f', 'face', tri);
+        const existing = selectionIndexByKey(selKey);
+        if (existing >= 0) state.selection.splice(existing, 1);
+        else state.selection.push({ kind: 'f', key: selKey, indices: tri.slice(), centroidLocal });
+
+        recolorSelection(obj);
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /* ===== MOVEMENT ===== */
+  let accumulatedLocalDelta = new THREE.Vector3(0,0,0);
+
+  function applySelectionWorldDelta(obj, worldDelta) {
+    if (!hasSelection()) return 0;
+
+    const p0 = obj.worldToLocal(obj.position.clone());
+    const p1 = obj.worldToLocal(obj.position.clone().add(worldDelta));
+    const dLocal = p1.sub(p0);
+
+    const unique = new Set();
+    state.selection.forEach(s => s.indices.forEach(i => unique.add(i)));
+
+    const pos = obj.geometry.attributes.position;
+    unique.forEach(i => {
+      pos.setXYZ(i,
+        pos.getX(i) + dLocal.x,
+        pos.getY(i) + dLocal.y,
+        pos.getZ(i) + dLocal.z
+      );
     });
 
-    function updateVertexPosition(vHandle, inverseMatrix) {
-        const localPos = vHandle.position.clone().applyMatrix4(inverseMatrix);
-        const indices = vHandle.userData.indices;
-        const attrPos = targetObject.geometry.attributes.position;
+    pos.needsUpdate = true;
+    obj.geometry.computeVertexNormals();
+    obj.geometry.computeBoundingBox();
+    obj.geometry.computeBoundingSphere();
 
-        indices.forEach(idx => {
-            attrPos.setXYZ(idx, localPos.x, localPos.y, localPos.z);
-        });
-        attrPos.needsUpdate = true;
+    state.selection.forEach(s => { s.centroidLocal.add(dLocal); });
+    accumulatedLocalDelta.add(dLocal);
+
+    refreshHelpers(obj);
+
+    const beforeCenterW = getSelectionWorldCenterForObject(obj);
+    const afterCenterW = getSelectionWorldCenterForObject(obj);
+    if (!beforeCenterW || !afterCenterW) return dLocal.length();
+    return afterCenterW.distanceTo(beforeCenterW);
+  }
+
+  /* ===== WELDING ===== */
+  function checkWeld(obj) {
+    if (!state.flags.verts || state.flags.explode) return null;
+    if (!hasSelection()) return null;
+
+    // Check if selection has any vertex groups
+    const vertexSelections = state.selection.filter(s => s.kind === 'v');
+    if (vertexSelections.length === 0) return null;
+
+    // Get all unique vertex indices from selection
+    const selectedIndices = new Set();
+    vertexSelections.forEach(s => s.indices.forEach(i => selectedIndices.add(i)));
+
+    // Build all vertex groups
+    const groups = buildVertexGroups(obj);
+    const pos = obj.geometry.attributes.position;
+
+    // For each selected vertex, check if there's a nearby non-selected vertex
+    for (const idx of selectedIndices) {
+      const p1 = new THREE.Vector3(pos.getX(idx), pos.getY(idx), pos.getZ(idx));
+      
+      for (let i = 0; i < pos.count; i++) {
+        if (selectedIndices.has(i)) continue; // skip other selected vertices
+        
+        const p2 = new THREE.Vector3(pos.getX(i), pos.getY(i), pos.getZ(i));
+        const dist = p1.distanceTo(p2);
+        
+        if (dist > 0.01 && dist < 0.4) {
+          // Found a nearby vertex - return weld info
+          const targetKey = keyForPos(pos.getX(i), pos.getY(i), pos.getZ(i));
+          const targetIndices = groups.get(targetKey) ?? [i];
+          
+          return {
+            sourceIndices: Array.from(selectedIndices),
+            targetPosition: p2.clone(),
+            targetIndices: targetIndices
+          };
+        }
+      }
     }
 
-    function updateHelperLinks(activeHandle) {
-        // Si muevo un vértice, actualizar posición y rotación de bordes conectados
-        if (activeHandle.userData.type === 'vertex') {
-            const id = activeHandle.userData.id;
-            eHandles.forEach(edge => {
-                if (edge.userData.v1 === id || edge.userData.v2 === id) {
-                    const p1 = vHandles[edge.userData.v1].position;
-                    const p2 = vHandles[edge.userData.v2].position;
-                    edge.position.copy(p1).add(p2).multiplyScalar(0.5);
-                    edge.lookAt(p2);
-                    edge.scale.z = p1.distanceTo(p2);
-                }
-            });
-        }
-    }
+    return null;
+  }
 
-    // --- LÓGICA DE SOLDAR (WELD) ---
-    
-    const weldPanel = document.getElementById('weld-panel');
-    let weldPending = null;
+  function applyWeld(obj, weldInfo) {
+    if (!weldInfo) return;
 
-    // Detectar cuando soltamos el drag
-    transformControl.addEventListener('dragging-changed', (e) => {
-        const isDragging = e.value;
-        if (!isDragging && currentMode === 'vertex' && transformControl.object) {
-            checkWeld(transformControl.object);
-        }
+    const pos = obj.geometry.attributes.position;
+    const targetPos = weldInfo.targetPosition;
+
+    // Move all source indices to target position
+    weldInfo.sourceIndices.forEach(i => {
+      pos.setXYZ(i, targetPos.x, targetPos.y, targetPos.z);
     });
 
-    function checkWeld(handle) {
-        // Buscar vértice cercano
-        let closest = null;
-        let minD = 0.3; // Distancia de imantación
+    pos.needsUpdate = true;
+    obj.geometry.computeVertexNormals();
+    obj.geometry.computeBoundingBox();
+    obj.geometry.computeBoundingSphere();
 
-        for (const other of vHandles) {
-            if (other === handle) continue;
-            const d = handle.position.distanceTo(other.position);
-            if (d < minD) {
-                closest = other;
-                break;
-            }
-        }
+    // Update selection centroids
+    state.selection.forEach(s => {
+      if (s.kind === 'v') {
+        s.centroidLocal.copy(targetPos);
+      }
+    });
 
-        if (closest) {
-            weldPending = { src: handle, dest: closest };
-            weldPanel.classList.add('visible');
-        } else {
-            weldPanel.classList.remove('visible');
-            weldPending = null;
-        }
-    }
+    refreshHelpers(obj);
+  }
 
-    // Listeners botones panel weld
-    document.getElementById('weld-yes').onclick = () => {
-        if (weldPending && targetObject) {
-            // Mover visualmente
-            weldPending.src.position.copy(weldPending.dest.position);
-            
-            // Actualizar geometría
-            const inverseMatrix = targetObject.matrixWorld.clone().invert();
-            updateVertexPosition(weldPending.src, inverseMatrix);
-            
-            // Ocultar panel
-            weldPanel.classList.remove('visible');
-            transformControl.detach();
-            
-            // OPCIONAL: Reconstruir helpers para que los dos puntos se vuelvan uno solo (Merge real)
-            // Si quieres que se conviertan en un solo punto, descomenta esto:
-             rebuildHelpers(); 
-        }
-    };
+  function setWeldPending(info) {
+    state.weldPending = info;
+  }
 
-    document.getElementById('weld-no').onclick = () => {
-        weldPanel.classList.remove('visible');
-        weldPending = null;
-    };
+  function getWeldPending() {
+    return state.weldPending;
+  }
+
+  function clearWeldPending() {
+    state.weldPending = null;
+  }
+
+  /* ===== UNDO/REDO ===== */
+  function commitSelectionDeltaAsAction(objectId) {
+    if (!objectId) return null;
+    if (!hasSelection()) return null;
+    if (accumulatedLocalDelta.lengthSq() < 1e-12) return null;
+
+    const unique = new Set();
+    state.selection.forEach(s => s.indices.forEach(i => unique.add(i)));
+    const indices = Array.from(unique);
+
+    const d = accumulatedLocalDelta.clone();
+    accumulatedLocalDelta.set(0,0,0);
 
     return {
-        activate,
-        deactivate,
-        setMode,
-        setExplode,
-        onPointerDown
+      type: 'subEdit',
+      id: objectId,
+      indices,
+      delta: { x: d.x, y: d.y, z: d.z }
     };
+  }
+
+  function applyDeltaLocalToIndices(obj, indices, dLocal) {
+    const pos = obj.geometry.attributes.position;
+    for (const i of indices) {
+      pos.setXYZ(i,
+        pos.getX(i) + dLocal.x,
+        pos.getY(i) + dLocal.y,
+        pos.getZ(i) + dLocal.z
+      );
+    }
+    pos.needsUpdate = true;
+    obj.geometry.computeVertexNormals();
+    obj.geometry.computeBoundingBox();
+    obj.geometry.computeBoundingSphere();
+    refreshHelpers(obj);
+  }
+
+  function applySubEditForward(action) {
+    const obj = findObjectById(action.id);
+    if (!obj) return;
+    applyDeltaLocalToIndices(obj, action.indices, new THREE.Vector3(action.delta.x, action.delta.y, action.delta.z));
+  }
+
+  function applySubEditInverse(action) {
+    const obj = findObjectById(action.id);
+    if (!obj) return;
+    applyDeltaLocalToIndices(obj, action.indices, new THREE.Vector3(-action.delta.x, -action.delta.y, -action.delta.z));
+  }
+
+  /* ===== PUBLIC API ===== */
+  return {
+    getFlags,
+    setFlags,
+
+    applySubVisibility,
+
+    togglePick,
+    clearSelection,
+    hasSelection,
+
+    getSelectionWorldCenter,
+
+    applySelectionWorldDelta,
+
+    setBaselineFromCurrent,
+    cancelToBaseline,
+    commitSelectionDeltaAsAction,
+
+    applySubEditForward,
+    applySubEditInverse,
+
+    checkWeld,
+    applyWeld,
+    setWeldPending,
+    getWeldPending,
+    clearWeldPending
+  };
 }
