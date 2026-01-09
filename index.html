@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>MR Studio - Touch Editor</title>
+    <style>
+        /* --- ESTILO BASE (ESTILO ESM VERSION) --- */
+        body { margin: 0; overflow: hidden; background-color: #1a1a1a; font-family: sans-serif; touch-action: none; color: white; }
+        
+        /* UI SUPERIOR (MODOS EDICIÓN) */
+        #top-bar {
+            position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+            display: flex; gap: 10px; background: rgba(40, 40, 40, 0.9);
+            padding: 8px 12px; border-radius: 12px; border: 1px solid #555;
+            backdrop-filter: blur(4px); z-index: 20;
+            transition: all 0.3s ease;
+        }
+        #top-bar.hidden { transform: translate(-50%, -150%); opacity: 0; pointer-events: none; }
+
+        .mode-btn {
+            width: 44px; height: 44px; border: none; border-radius: 8px;
+            background: #333; color: #888; cursor: pointer; display: flex; align-items: center; justify-content: center;
+            font-size: 20px; transition: 0.2s;
+        }
+        .mode-btn:hover { background: #444; color: white; }
+        .mode-btn.active { color: white; transform: scale(1.1); }
+        
+        /* Colores específicos por modo */
+        .mode-btn.active[data-sub="vertex"] { background: #e74c3c; box-shadow: 0 0 10px rgba(231, 76, 60, 0.5); }
+        .mode-btn.active[data-sub="edge"] { background: #f1c40f; box-shadow: 0 0 10px rgba(241, 196, 15, 0.5); color: #222; }
+        .mode-btn.active[data-sub="face"] { background: #3498db; box-shadow: 0 0 10px rgba(52, 152, 219, 0.5); }
+
+        /* Botón Explode (Específico) */
+        .explode-toggle { font-size: 12px; font-weight: bold; width: auto; padding: 0 10px; }
+        .explode-toggle.active { background: #9b59b6; color: white; box-shadow: 0 0 10px rgba(155, 89, 182, 0.5); }
+
+        /* BARRA INFERIOR (CREACIÓN Y GLOBAL) */
+        #bottom-bar {
+            position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+            display: flex; gap: 8px; flex-wrap: wrap; justify-content: center;
+            max-width: 95%; pointer-events: none; z-index: 10;
+        }
+        .toolbar {
+            pointer-events: auto; background: rgba(40, 40, 40, 0.95);
+            padding: 10px; border-radius: 16px; border: 1px solid #555;
+            display: flex; gap: 8px; overflow-x: auto;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+        }
+        .tool-btn {
+            width: 50px; height: 50px; border-radius: 10px; border: none;
+            background: #2a2a2a; color: #ccc; font-size: 24px;
+            display: flex; flex-direction: column; align-items: center; justify-content: center;
+            cursor: pointer; flex-shrink: 0; transition: 0.2s;
+        }
+        .tool-btn span { font-size: 9px; margin-top: 2px; font-weight: bold; }
+        .tool-btn.active { background: #FF9500; color: white; transform: translateY(-2px); }
+        .tool-btn:active { transform: scale(0.95); }
+
+        /* PANEL SOLDAR (WELD) */
+        #weld-panel {
+            position: absolute; bottom: 120px; left: 50%; transform: translateX(-50%);
+            background: #2d3436; color: white; padding: 15px 25px;
+            border-radius: 12px; border: 2px solid #00b894;
+            display: flex; flex-direction: column; align-items: center; gap: 10px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.6); z-index: 100;
+            opacity: 0; pointer-events: none; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            transform: translate(-50%, 20px);
+        }
+        #weld-panel.visible { opacity: 1; pointer-events: auto; transform: translate(-50%, 0); }
+        .weld-btns { display: flex; gap: 15px; }
+        .weld-action { padding: 8px 20px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; }
+        .btn-yes { background: #00b894; color: white; }
+        .btn-no { background: #d63031; color: white; }
+
+        /* UTILIDADES */
+        #loader {
+            position: fixed; inset: 0; background: #111; z-index: 999;
+            display: flex; align-items: center; justify-content: center; color: #888;
+        }
+        .divider { width: 1px; background: #555; margin: 0 5px; }
+    </style>
+    
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://ga.jspm.io/npm:three@0.160.0/build/three.module.js",
+            "three/addons/": "https://ga.jspm.io/npm:three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+
+    <div id="loader">Cargando Motor 3D...</div>
+
+    <div id="top-bar" class="hidden">
+        <button class="mode-btn active" data-sub="vertex" title="Vértices">●</button>
+        <button class="mode-btn" data-sub="edge" title="Bordes">━</button>
+        <button class="mode-btn" data-sub="face" title="Caras">■</button>
+        <div class="divider"></div>
+        <button class="mode-btn explode-toggle" id="btn-explode" title="Separar vértices">MERGE</button>
+        <div class="divider"></div>
+        <button class="mode-btn" id="btn-exit-sub" style="background:#d63031; color:white;">✕</button>
+    </div>
+
+    <div id="weld-panel">
+        <div style="font-weight:900; font-size:14px;">🔗 UNIR VÉRTICES</div>
+        <div class="weld-btns">
+            <button class="weld-action btn-yes" id="weld-yes">SÍ</button>
+            <button class="weld-action btn-no" id="weld-no">NO</button>
+        </div>
+    </div>
+
+    <div id="bottom-bar">
+        <div class="toolbar">
+            <button class="tool-btn" data-spawn="box">📦<span>Cubo</span></button>
+            <button class="tool-btn" data-spawn="sphere">⚪<span>Esfera</span></button>
+            <button class="tool-btn" data-spawn="cone">🔺<span>Cono</span></button>
+            <div class="divider"></div>
+            <button class="tool-btn active" id="mode-global">🌍<span>Global</span></button>
+            <button class="tool-btn" id="mode-edit">✏️<span>Editar</span></button>
+            <div class="divider"></div>
+            <button class="tool-btn" id="btn-undo" style="opacity:0.5">⟲</button>
+            <button class="tool-btn" id="btn-delete" style="color:#ff6b6b">🗑️</button>
+        </div>
+    </div>
+
+    <script type="module" src="./editor-core.js"></script>
+</body>
+</html>
